@@ -245,12 +245,15 @@ class MCPCLI:
             else:
                 param_type = str
 
+            # Get the default value from schema, or None if not specified
+            default_value = p_schema.get("default", None)
+
             sig_params.append(
                 inspect.Parameter(
                     p_name,
                     inspect.Parameter.KEYWORD_ONLY,
                     annotation=param_type,
-                    default=typer.Option(None, f"--{p_name}", help=p_schema.get("description"))
+                    default=typer.Option(default_value, f"--{p_name}", help=p_schema.get("description"))
                 )
             )
 
