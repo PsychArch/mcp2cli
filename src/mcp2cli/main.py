@@ -79,23 +79,40 @@ class MCPCLI:
             raise ValueError(f"Unknown or invalid transport configuration for server {server_name}")
 
     async def _load_server_tools(self, server_name: str, server_config: Dict[str, Any]):
-        session_context = None
+        """Load tools from server using improved session management to avoid TaskGroup issues."""
+        session = None
+        transport_context = None
+        
         try:
-            session_context = await self._get_client_session(server_name)
+            transport_context = await self._get_client_session(server_name)
             tools = []
+            
             if 'command' in server_config:
-                async with session_context as client_streams:
+                # Handle stdio connection
+                try:
+                    client_streams = await transport_context.__aenter__()
                     read, write = client_streams
-                    async with ClientSession(read, write) as session:
-                        await session.initialize()
-                        tool_list = await session.list_tools()
-                        tools = tool_list.tools
+                    
+                    session = ClientSession(read, write)
+                    await session.__aenter__()
+                    await session.initialize()
+                    tool_list = await session.list_tools()
+                    tools = tool_list.tools
+                except Exception as e:
+                    raise Exception(f"Failed to connect via stdio: {e}") from e
             else:
-                async with session_context as (read, write, _):
-                    async with ClientSession(read, write) as session:
-                        await session.initialize()
-                        tool_list = await session.list_tools()
-                        tools = tool_list.tools
+                # Handle HTTP/SSE connection
+                try:
+                    transport_streams = await transport_context.__aenter__()
+                    read, write, _ = transport_streams
+                    
+                    session = ClientSession(read, write)
+                    await session.__aenter__()
+                    await session.initialize()
+                    tool_list = await session.list_tools()
+                    tools = tool_list.tools
+                except Exception as e:
+                    raise Exception(f"Failed to connect via HTTP: {e}") from e
 
             self.servers[server_name]["tools"] = tools
             tool_names = [tool.name for tool in tools]
@@ -105,10 +122,24 @@ class MCPCLI:
                 if tool.name not in self.tool_to_servers:
                     self.tool_to_servers[tool.name] = []
                 self.tool_to_servers[tool.name].append(server_name)
+                
         except Exception as e:
             console.print(f"Error connecting to server '{server_name}': {e}", style="bold red")
             import traceback
             traceback.print_exc()
+        finally:
+            # Clean up in reverse order
+            if session:
+                try:
+                    await session.__aexit__(None, None, None)
+                except Exception as e:
+                    console.print(f"Session cleanup warning for {server_name}: {e}", style="yellow")
+            
+            if transport_context:
+                try:
+                    await transport_context.__aexit__(None, None, None)
+                except Exception as e:
+                    console.print(f"Transport cleanup warning for {server_name}: {e}", style="yellow")
 
     def _add_tool_commands(self):
         for tool_name, server_names in self.tool_to_servers.items():
@@ -432,7 +463,8 @@ class MCPCLI:
                 
                 try:
                     server_config = self.servers[chosen_server]
-                    session_context = await self._get_client_session(chosen_server)
+                    transport_context = await self._get_client_session(chosen_server)
+                    session = None
 
                     async def process_result(session):
                         await session.initialize()
@@ -486,15 +518,36 @@ class MCPCLI:
 
                             console.print(json.dumps({"result": result_val}))
 
-                    if 'command' in server_config:
-                        async with session_context as client_streams:
+                    try:
+                        if 'command' in server_config:
+                            # Handle stdio connection
+                            client_streams = await transport_context.__aenter__()
                             read, write = client_streams
-                            async with ClientSession(read, write) as session:
-                                await process_result(session)
-                    else:
-                        async with session_context as (read, write, _):
-                            async with ClientSession(read, write) as session:
-                                await process_result(session)
+                            
+                            session = ClientSession(read, write)
+                            await session.__aenter__()
+                            await process_result(session)
+                        else:
+                            # Handle HTTP/SSE connection
+                            transport_streams = await transport_context.__aenter__()
+                            read, write, _ = transport_streams
+                            
+                            session = ClientSession(read, write)
+                            await session.__aenter__()
+                            await process_result(session)
+                    finally:
+                        # Clean up in reverse order
+                        if session:
+                            try:
+                                await session.__aexit__(None, None, None)
+                            except Exception as e:
+                                console.print(f"Session cleanup warning: {e}", style="yellow")
+                        
+                        if transport_context:
+                            try:
+                                await transport_context.__aexit__(None, None, None)
+                            except Exception as e:
+                                console.print(f"Transport cleanup warning: {e}", style="yellow")
 
                 except Exception as e:
                     console.print(f"Error calling tool {tool_name} on server {chosen_server}: {e}", style="bold red")
